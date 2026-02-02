@@ -1,5 +1,10 @@
-import os, subprocess, threading, json, time, pytz
+import os
+import subprocess
+import threading
+import json
+import time
 from datetime import datetime
+import pytz 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -24,19 +29,20 @@ login_manager = LoginManager()
 login_manager.login_view = 'login'
 login_manager.init_app(app)
 
-# Global State Monitoring
+# Global State
 player_state = {
-    "current_file": "Ready / Tidak ada audio",
+    "current_file": "Tidak ada audio diputar",
     "is_playing": False,
     "is_paused": False,
-    "is_alarm": False,
     "time_pos": 0,
     "duration": 0,
     "percent": 0,
-    "volume": 100
+    "volume": 100,
+    "usb_label": "Mencari USB...",
+    "queue": [],
+    "manual_interrupted": False
 }
 
-# --- Model Database ---
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(100), unique=True, nullable=False)
@@ -44,20 +50,32 @@ class User(UserMixin, db.Model):
 
 class Schedule(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    time = db.Column(db.String(5), nullable=False) # Format HH:MM
+    time = db.Column(db.String(5), nullable=False)
     day = db.Column(db.String(20), nullable=False)
     audio_file = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(200))
 
 @login_manager.user_loader
-def load_user(user_id): return db.session.get(User, int(user_id))
+def load_user(user_id):
+    return db.session.get(User, int(user_id))
 
-# --- Logika MPV IPC ---
+# --- Logika Hardware & MPV ---
+def find_usb_device():
+    try:
+        output = subprocess.check_output(["aplay", "-L"]).decode('utf-8')
+        for line in output.splitlines():
+            if "CARD=Device" in line and "default" in line:
+                return line.strip()
+    except: pass
+    return None
+
 def send_ipc(cmd_list):
     if not os.path.exists(IPC_SOCKET): return False
     try:
         cmd = json.dumps({"command": cmd_list}) + "\n"
-        p = subprocess.Popen(['socat', '-', f'UNIX-CONNECT:{IPC_SOCKET}'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p.communicate(input=cmd.encode(), timeout=0.1)
+        process = subprocess.Popen(['socat', '-', f'UNIX-CONNECT:{IPC_SOCKET}'], 
+                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process.communicate(input=cmd.encode(), timeout=0.2)
         return True
     except: return False
 
@@ -65,47 +83,59 @@ def get_mpv_prop(prop):
     if not os.path.exists(IPC_SOCKET): return 0
     try:
         cmd = json.dumps({"command": ["get_property", prop]}) + "\n"
-        p = subprocess.Popen(['socat', '-', f'UNIX-CONNECT:{IPC_SOCKET}'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        res, _ = p.communicate(input=cmd.encode(), timeout=0.1)
-        return json.loads(res.decode()).get('data', 0)
+        process = subprocess.Popen(['socat', '-', f'UNIX-CONNECT:{IPC_SOCKET}'], 
+                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        response, _ = process.communicate(input=cmd.encode(), timeout=0.2)
+        return json.loads(response.decode()).get('data', 0)
     except: return 0
 
-# --- Fungsi Inti Putar Audio ---
-def play_audio(filename, is_alarm=False):
+# --- Pemutar Antrean Manual ---
+def play_worker():
     global player_state
-    
-    # Interupsi: Jika ada musik manual, jeda dulu
-    was_playing_manual = False
-    if is_alarm and player_state["is_playing"] and not player_state["is_alarm"]:
-        send_ipc(["set_property", "pause", True])
-        was_playing_manual = True
-        time.sleep(0.5)
+    while player_state["queue"]:
+        file_to_play = player_state["queue"].pop(0)
+        run_mpv(file_to_play)
 
-    if not is_alarm:
-        subprocess.run(["pkill", "-9", "mpv"], stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-
+def run_mpv(filename):
+    global player_state
+    usb_device = find_usb_device()
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    if os.path.exists(file_path):
-        old_file = player_state["current_file"]
-        player_state.update({"current_file": filename, "is_playing": True, "is_alarm": is_alarm})
-        
-        if is_alarm:
-            # Putar alarm (Blocking) - Volume paksa 100
-            subprocess.run(["mpv", "--no-video", "--audio-device=alsa/plughw:1,0", "--volume=100", file_path])
-            
-            # Resume musik manual setelah alarm selesai
-            if was_playing_manual:
-                player_state.update({"current_file": old_file, "is_alarm": False})
-                send_ipc(["set_property", "pause", False])
-            else:
-                player_state.update({"current_file": "Ready / Tidak ada audio", "is_playing": False, "is_alarm": False})
-        else:
-            # Putar Manual (IPC enabled)
-            subprocess.run(["mpv", "--no-video", "--audio-device=alsa/plughw:1,0", f"--volume={player_state['volume']}", f"--input-ipc-server={IPC_SOCKET}", file_path])
-            player_state.update({"current_file": "Ready / Tidak ada audio", "is_playing": False, "percent": 0})
+    
+    if not os.path.exists(file_path): return
 
-# --- Scheduler Engine ---
+    player_state.update({"current_file": filename, "is_playing": True, "is_paused": False})
+    dev_flag = f"alsa/{usb_device}" if usb_device else "alsa/plughw:1,0"
+    
+    # Menjalankan MPV (Blocking sampai lagu selesai)
+    subprocess.run(["mpv", "--no-video", f"--audio-device={dev_flag}", 
+                    f"--volume={player_state['volume']}",
+                    f"--input-ipc-server={IPC_SOCKET}", file_path])
+    
+    player_state.update({"current_file": "Tidak ada audio diputar", "is_playing": False, "percent": 0})
+
+# --- Pemutar Alarm (Priority) ---
+def trigger_alarm(filename):
+    global player_state
+    # 1. Pause lagu manual jika ada
+    was_playing = player_state["is_playing"] and not player_state["is_paused"]
+    if was_playing:
+        send_ipc(["set_property", "pause", True])
+        player_state["manual_interrupted"] = True
+
+    # 2. Putar Alarm - Volume Paksa 100%
+    usb_device = find_usb_device()
+    dev_flag = f"alsa/{usb_device}" if usb_device else "alsa/plughw:1,0"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    
+    # Gunakan subprocess mandiri untuk alarm
+    subprocess.run(["mpv", "--no-video", f"--audio-device={dev_flag}", "--volume=100", file_path])
+
+    # 3. Resume lagu manual
+    if player_state["manual_interrupted"]:
+        send_ipc(["set_property", "pause", False])
+        player_state["manual_interrupted"] = False
+
+# --- Scheduler ---
 scheduler = BackgroundScheduler(timezone=jakarta_tz)
 scheduler.start()
 
@@ -114,10 +144,12 @@ def reload_jobs():
     with app.app_context():
         for s in Schedule.query.all():
             h, m = s.time.split(':')
-            day_map = {'Monday':'mon','Tuesday':'tue','Wednesday':'wed','Thursday':'thu','Friday':'fri','Saturday':'sat','Sunday':'sun'}
-            scheduler.add_job(play_audio, 'cron', day_of_week=day_map.get(s.day), hour=h, minute=m, args=[s.audio_file, True])
+            day_map = {'Everyday': '*', 'Monday': 'mon', 'Tuesday': 'tue', 'Wednesday': 'wed',
+                       'Thursday': 'thu', 'Friday': 'fri', 'Saturday': 'sat', 'Sunday': 'sun'}
+            scheduler.add_job(trigger_alarm, 'cron', day_of_week=day_map.get(s.day, '*'), 
+                              hour=h, minute=m, args=[s.audio_file])
 
-# --- Routes ---
+# --- Flask Routes ---
 @app.route('/')
 @login_required
 def index():
@@ -125,62 +157,73 @@ def index():
     files = sorted(os.listdir(app.config['UPLOAD_FOLDER'])) if os.path.exists(app.config['UPLOAD_FOLDER']) else []
     return render_template('index.html', schedules=schedules, files=files)
 
+@app.route('/upload', methods=['POST'])
+@login_required
+def upload():
+    file = request.files.get('file')
+    if file and file.filename != '':
+        filename = secure_filename(file.filename)
+        file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+        flash(f'File {filename} berhasil diunggah!')
+    return redirect(url_for('index'))
+
+@app.route('/audio/add_queue/<f>')
+@login_required
+def add_queue(f):
+    player_state["queue"].append(f)
+    if not player_state["is_playing"]:
+        threading.Thread(target=play_worker).start()
+    return jsonify({"status": "queued", "queue": player_state["queue"]})
+
 @app.route('/get_status')
 def get_status():
-    global player_state
+    usb_active = find_usb_device()
+    player_state["usb_label"] = "🎸 USB PnP Audio Aktif" if usb_active else "⚠️ USB Terputus"
+    
     if player_state["is_playing"] and os.path.exists(IPC_SOCKET):
         player_state["time_pos"] = get_mpv_prop("time-pos")
         player_state["duration"] = get_mpv_prop("duration")
         if player_state["duration"] > 0:
             player_state["percent"] = (player_state["time_pos"] / player_state["duration"]) * 100
     
-    state = player_state.copy()
-    state["server_time"] = datetime.now(jakarta_tz).strftime("%H:%M:%S")
-    return jsonify(state)
-
-@app.route('/audio/volume/<int:level>')
-@login_required
-def set_volume(level):
-    global player_state
-    level = max(0, min(100, level))
-    player_state["volume"] = level
-    if not player_state["is_alarm"]: send_ipc(["set_property", "volume", level])
-    return jsonify({"status": "ok"})
+    res = player_state.copy()
+    res["server_time"] = datetime.now(jakarta_tz).strftime("%H:%M:%S")
+    return jsonify(res)
 
 @app.route('/audio/<action>')
 @login_required
 def control_audio(action):
-    if action == "pause": send_ipc(["set_property", "pause", True])
-    elif action == "resume": send_ipc(["set_property", "pause", False])
-    elif action == "stop": subprocess.run(["pkill", "-9", "mpv"])
-    return jsonify({"status": "ok"})
+    if action == "pause": 
+        if send_ipc(["set_property", "pause", True]): player_state["is_paused"] = True
+    elif action == "resume": 
+        if send_ipc(["set_property", "pause", False]): player_state["is_paused"] = False
+    elif action == "stop": 
+        send_ipc(["quit"])
+        player_state["queue"] = []
+        player_state["is_playing"] = False
+    return jsonify(player_state)
+
+@app.route('/audio/volume/<int:level>')
+@login_required
+def set_volume(level):
+    level = max(0, min(100, level))
+    player_state["volume"] = level
+    send_ipc(["set_property", "volume", level])
+    return jsonify({"status": "success", "volume": level})
 
 @app.route('/add_schedule', methods=['POST'])
 @login_required
 def add_schedule():
-    new_s = Schedule(time=request.form['time'], day=request.form['day'], audio_file=request.form['audio_file'])
+    new_s = Schedule(time=request.form['time'], day=request.form['day'], 
+                     audio_file=request.form['audio_file'], description=request.form['description'])
     db.session.add(new_s); db.session.commit(); reload_jobs()
-    return redirect(url_for('index'))
-
-@app.route('/edit_schedule/<int:id>', methods=['POST'])
-@login_required
-def edit_schedule(id):
-    s = db.session.get(Schedule, id)
-    if s:
-        s.time, s.audio_file = request.form['time'], request.form['audio_file']
-        db.session.commit(); reload_jobs()
     return redirect(url_for('index'))
 
 @app.route('/delete_schedule/<int:id>')
 @login_required
 def delete_schedule(id):
-    s = db.session.get(Schedule, id); db.session.delete(s); db.session.commit(); reload_jobs()
-    return redirect(url_for('index'))
-
-@app.route('/play_test/<f>')
-@login_required
-def play_test(f):
-    threading.Thread(target=play_audio, args=(f, False)).start()
+    s = db.session.get(Schedule, id)
+    if s: db.session.delete(s); db.session.commit(); reload_jobs()
     return redirect(url_for('index'))
 
 @app.route('/delete_file/<f>')
@@ -194,7 +237,8 @@ def delete_file(f):
 def login():
     if request.method == 'POST':
         user = User.query.filter_by(username=request.form['username']).first()
-        if user and check_password_hash(user.password, request.form['password']): login_user(user); return redirect(url_for('index'))
+        if user and check_password_hash(user.password, request.form['password']):
+            login_user(user); return redirect(url_for('index'))
     return render_template('login.html')
 
 @app.route('/logout')
@@ -205,7 +249,7 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         if not User.query.filter_by(username='admin').first():
-            db.session.add(User(username='admin', password=generate_password_hash('admin123', method='pbkdf2:sha256')))
+            db.session.add(User(username='admin', password=generate_password_hash('admin123')))
             db.session.commit()
         reload_jobs()
     app.run(host='0.0.0.0', port=5000)
