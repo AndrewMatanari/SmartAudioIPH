@@ -1,0 +1,8 @@
+music/
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.aac
+*.log
+*.db
